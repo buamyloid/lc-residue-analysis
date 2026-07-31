@@ -2,7 +2,7 @@
 
 ## Welcome to Light Chain Sequence Analysis
 
-This web application analyzes antibody light chain sequences with IMGT numbering and VJ gene assignment.
+This web application analyzes antibody light chain sequences with pairwise germline alignment and IMGT-like numbering.
 Written mostly by Anthropic Claude with help from Gareth Morgan, Boston University Amyloidosis Center. 
 Implements the residue frequency analysis described in Morgan and Prokaeva (2025) Frontiers in Immunology https://www.frontiersin.org/journals/immunology/articles/10.3389/fimmu.2025.1622207/full 
 Please cite this paper if you publish anything that uses this analysis. 
@@ -16,12 +16,13 @@ The goal is to identify residues that are infrequently observed among healthy li
    - Paste a protein sequence (single letter amino acid code)
    - Example: `DIQMTQSPSVSVAPGKTARISCSGDGSYNN...`
 
-2. **Click "Run ANARCI"**
-   - First time may take 1-2 minutes (downloads alignment models)
-   - Subsequent submissions are instant
+2. **Choose alignment mode and run alignment**
+   - Choose best, Kappa, or Lambda
+   - Optionally pick a specific germline gene override
+   - Click "Run Pairwise Alignment"
 
 3. **Review results**
-   - View V/D/J gene assignments
+   - View V/J gene assignments
    - Check alignment metrics
    - Identify N-glycosylation sites
 
@@ -40,12 +41,12 @@ The goal is to identify residues that are infrequently observed among healthy li
 
 **What it does:**
 - Aligns your sequence to IMGT numbering scheme
-- Identifies V, D, and J germline genes
+- Identifies best-matching V or J germline gene
 - Detects potential N-glycosylation sites
 
 **Metrics explained:**
 - **Query Length**: Total amino acids in your sequence
-- **Chain**: Antibody chain type (H or L)
+- **Chain**: Light chain type (K or L)
 - **Unmatched Indels**: Gaps that don't align with germline
 - **Percent Identity**: Similarity to germline sequence
 - **Residue Changes**: Number of mutations from germline
@@ -93,7 +94,6 @@ The goal is to identify residues that are infrequently observed among healthy li
 |------|---------|
 | **IMGT** | International ImMunoGeneTics - standardized numbering system |
 | **V gene** | Variable gene segment (most variable region) |
-| **D gene** | Diversity gene segment (heavy chain only) |
 | **J gene** | Joining gene segment |
 | **Germline** | Original, unmutated reference sequence |
 | **Alignment** | Positioning sequence to standard numbering |
@@ -103,9 +103,9 @@ The goal is to identify residues that are infrequently observed among healthy li
 
 ## Frequently Asked Questions
 
-### Q: Why does the first alignment (sometimes) take 1-2 minutes?
+### Q: Why is no first-run download needed now?
 
-**A:** The app downloads alignment models (~150 MB) on first use. These are cached afterwards, so all subsequent alignments are instant.
+**A:** Alignment is performed with a built-in pairwise method against the bundled IMGT FASTA database. No model download step is required.
 
 ### Q: What sequence format should I use?
 
@@ -118,20 +118,17 @@ The goal is to identify residues that are infrequently observed among healthy li
 ### Q: What if I get an error?
 
 **A:** Common solutions:
-- **"ANARCI initialization failed"** → Refresh the page and try again
+ - **"No compatible germline candidates found"** → Adjust chain mode or germline selection
 - **"No sequence returned"** → Check your sequence is at least 50 amino acids
 - **"Export not working"** → Try a different browser or disable pop-up blockers
 
 ### Q: Can I use this for heavy chains?
 
-**A:** The aligner will work but the residue frequency data is currently only available for light chains.
+**A:** This app is tuned for light chains. Residue frequency data is currently only available for light-chain V genes.
 
 ### Q: What if my gene isn't recognized?
 
-**A:** The app searches for matches in the IMGT database:
-- Human and mouse genes supported
-- Other species: install locally for custom databases
-- Partial matches may appear if exact gene not found
+**A:** The app searches the bundled IMGT light-chain germline FASTA and selects the best global pairwise score within your selected mode.
 
 ---
 
@@ -139,8 +136,8 @@ The goal is to identify residues that are infrequently observed among healthy li
 
 **Available:**
 - ✅ IMGT numbering alignment
-- ✅ V/D/J gene assignment
-- ✅ Human and mouse species
+- ✅ Pairwise germline alignment
+- ✅ V/J gene assignment
 - ✅ Residue frequency analysis
 - ✅ Multiple export formats
 - ✅ N-glycosylation detection
@@ -148,7 +145,7 @@ The goal is to identify residues that are infrequently observed among healthy li
 **Not available in web version:**
 - ❌ Custom germline databases
 - ❌ Custom species/organisms
-- ❌ Advanced ANARCI options
+- ❌ HMM-model antibody numbering workflows
 - ❌ Batch processing
 - ❌ Custom frequency matrices
 - ❌ Local data storage
@@ -192,7 +189,6 @@ https://www.frontiersin.org/journals/immunology/articles/10.3389/fimmu.2025.1622
 
 ## Key Methods Used:
 
-ANARCI: Dunbar J, et al. (2016) SAbDab: the structural antibody database. Nucleic Acids Research
 IMGT Numbering: Lefranc MP, et al. (2015) IMGT, the International ImMunoGeneTics information system. Nucleic Acids Research
 
 ## Data Privacy
@@ -219,7 +215,6 @@ Try a different browser
 ## Acknowledgments
 This tool uses:
 
-ANARCI for antibody numbering
 IMGT reference databases
 OAS (Observed Antibody Space) for frequency data
 Streamlit for the web interface

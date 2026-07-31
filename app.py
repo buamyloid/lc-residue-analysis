@@ -1,6 +1,6 @@
 # ============================================================================
 # LIGHT CHAIN SEQUENCE ANALYSIS - INITIALIZATION
-# Complete startup code with lazy-loaded ANARCI (no pre-caching)
+# Pairwise light-chain germline alignment workflow
 # ============================================================================
 
 # ============================================================================
@@ -23,8 +23,10 @@ matplotlib.use('Agg')
 
 # Biology
 from Bio import SeqIO
+from Bio.Align import PairwiseAligner
 
 # System utilities
+import html
 import json
 import warnings
 import re
@@ -53,6 +55,7 @@ N_GLYCOSYLATION_PATTERN = r'N[^P][ST]'
 RARE_RESIDUE_THRESHOLD_1 = 0.001
 RARE_RESIDUE_THRESHOLD_2 = 0.1
 FREQUENCY_LOOKUP_CACHE_SIZE = 1000
+GERMLINE_BEST_OPTION = "Choose best within selected group"
 
 # ============================================================================
 # SESSION STATE INITIALIZATION
@@ -65,29 +68,6 @@ if "initialized" not in st.session_state:
     st.session_state.seq_name = ""
     st.session_state.input_seq = ""
     st.session_state.initialized = True
-
-# ============================================================================
-# LAZY ANARCI LOADER
-# ============================================================================
-
-@st.cache_resource
-def get_anarci():
-    """
-    Lazy load ANARCI only when needed.
-    
-    This delays ANARCI import until first alignment request.
-    HMMER models download on first use (~1-2 minutes).
-    Subsequent uses are instant (cached in memory).
-    
-    Returns:
-        anarci module or None if import fails
-    """
-    try:
-        import anarci
-        return anarci
-    except ImportError as e:
-        st.error(f"❌ Failed to import ANARCI: {e}")
-        return None
 
 # ============================================================================
 # DATABASE LOADING
@@ -237,131 +217,364 @@ def normalize_v_gene(v_gene: str) -> str:
     return v_gene
 
 # ============================================================================
-# ANARCI ALIGNMENT
+# PAIRWISE GERMLINE ALIGNMENT
 # ============================================================================
 
-def run_anarci_alignment(sequence: str, seq_id: str = "query") -> Optional[Dict]:
-    """
-    Run ANARCI on input sequence with germline assignment.
-    ANARCI is lazy-loaded on first call.
-    
-    Args:
-        sequence: Protein sequence
-        seq_id: Sequence identifier
-        
-    Returns:
-        Dictionary with alignment results
-    """
+def infer_chain_type(germline_id: str) -> Optional[str]:
+    """Infer chain type from germline ID."""
+    if germline_id.startswith("IGK"):
+        return "K"
+    if germline_id.startswith("IGL"):
+        return "L"
+    return None
+
+
+def infer_gene_segment(germline_id: str) -> Optional[str]:
+    """Infer gene segment (V/J) from germline ID."""
+    if "KV" in germline_id or "LV" in germline_id:
+        return "V"
+    if "KJ" in germline_id or "LJ" in germline_id:
+        return "J"
+    return None
+
+
+def load_imgt_v_template_table(tsv_file: Optional[str] = None) -> pd.DataFrame:
+    """Load VJ IMGT-gapped templates from TSV and annotate V-gene metadata."""
+    if tsv_file is None:
+        possible_paths = [
+            Path("data/imgt.all.lc.alleles.txt"),
+            Path("./data/imgt.all.lc.alleles.txt"),
+        ]
+        for path in possible_paths:
+            if path.exists():
+                tsv_file = str(path)
+                break
+
+    if tsv_file is None or not Path(tsv_file).exists():
+        return pd.DataFrame()
+
     try:
-        # Lazy load ANARCI
-        anarci = get_anarci()
-        if anarci is None:
-            return {"status": "error", "message": "ANARCI not available"}
-        
+        df = pd.read_csv(tsv_file, sep="\t")
+    except Exception:
+        return pd.DataFrame()
+
+    df.columns = [str(col).strip().strip('"') for col in df.columns]
+    for col in ["v_allele", "j_allele", "vj_sequence_imgt"]:
+        if col not in df.columns:
+            return pd.DataFrame()
+
+    df["v_allele"] = df["v_allele"].astype(str).str.strip().str.strip('"')
+    df["j_allele"] = df["j_allele"].astype(str).str.strip().str.strip('"')
+    df["vj_sequence_imgt"] = df["vj_sequence_imgt"].astype(str).str.strip().str.strip('"')
+    df = df[(df["v_allele"] != "") & (df["vj_sequence_imgt"] != "")]
+
+    # Keep one record per unique V/J combination + IMGT-gapped template.
+    df = df.drop_duplicates(subset=["v_allele", "j_allele", "vj_sequence_imgt"]).copy()
+    df["v_gene"] = df["v_allele"].apply(normalize_v_gene)
+    df["chain"] = df["v_allele"].apply(infer_chain_type)
+
+    return df
+
+
+@st.cache_resource(show_spinner=False)
+def get_imgt_v_template_table() -> pd.DataFrame:
+    """Load and cache IMGT VJ-gapped template table."""
+    return load_imgt_v_template_table()
+
+
+@st.cache_resource(show_spinner=False)
+def get_germline_records() -> List[Dict]:
+    """Build structured VJ-template records while tracking collapsed V-gene IDs."""
+    records = []
+    template_df = get_imgt_v_template_table()
+    for _, row in template_df.iterrows():
+        v_allele = str(row["v_allele"])
+        j_allele = str(row["j_allele"])
+        vj_imgt = str(row["vj_sequence_imgt"])
+        records.append({
+            "gene_id": f"{v_allele}|{j_allele}",
+            "v_gene": normalize_v_gene(v_allele),
+            "v_allele": v_allele,
+            "j_allele": j_allele,
+            "aligned_seq": vj_imgt,
+            "ungapped_seq": vj_imgt.replace("-", ""),
+            "chain": infer_chain_type(v_allele),
+            "segment": "V",
+        })
+    return records
+
+
+def get_gene_choices(chain_filter: Optional[str]) -> List[str]:
+    """Return selectable collapsed V-gene IDs for a chain filter."""
+    choices = []
+    for record in get_germline_records():
+        if chain_filter and record["chain"] != chain_filter:
+            continue
+        if record.get("v_gene"):
+            choices.append(record["v_gene"])
+    return sorted(set(choices))
+
+
+def _alignment_to_strings(target: str, query: str, alignment) -> Tuple[str, str]:
+    """Convert PairwiseAligner coordinates into aligned target/query strings."""
+    target_parts: List[str] = []
+    query_parts: List[str] = []
+
+    coords = alignment.coordinates
+    for i in range(coords.shape[1] - 1):
+        t0, t1 = int(coords[0, i]), int(coords[0, i + 1])
+        q0, q1 = int(coords[1, i]), int(coords[1, i + 1])
+        t_len = t1 - t0
+        q_len = q1 - q0
+
+        if t_len > 0 and q_len > 0:
+            target_parts.append(target[t0:t1])
+            query_parts.append(query[q0:q1])
+        elif t_len > 0:
+            target_parts.append(target[t0:t1])
+            query_parts.append("-" * t_len)
+        elif q_len > 0:
+            target_parts.append("-" * q_len)
+            query_parts.append(query[q0:q1])
+
+    return "".join(target_parts), "".join(query_parts)
+
+
+def _project_alignment_to_gapped_template(
+    template_gapped: str,
+    aligned_template_ungapped: str,
+    aligned_query: str,
+) -> Tuple[str, str, List[Optional[int]]]:
+    """Project ungapped alignment onto IMGT-gapped template columns.
+
+    Returns:
+        tuple(aligned_template, aligned_query, template_column_map)
+        template_column_map entries are 1-based template column indices or None
+        for true query insertions that fall outside the template columns.
+    """
+    template_positions: List[str] = []
+    query_positions: List[str] = []
+    template_column_map: List[Optional[int]] = []
+
+    aligned_pairs = list(zip(aligned_template_ungapped, aligned_query))
+    pair_idx = 0
+
+    def flush_inserts(before_ungapped_index: int) -> None:
+        nonlocal pair_idx
+        seen_ungapped = 0
+        for i in range(pair_idx):
+            if aligned_pairs[i][0] != "-":
+                seen_ungapped += 1
+        while pair_idx < len(aligned_pairs):
+            t_char, q_char = aligned_pairs[pair_idx]
+            if t_char != "-":
+                break
+            template_positions.append("-")
+            query_positions.append(q_char)
+            template_column_map.append(None)
+            pair_idx += 1
+
+    ungapped_seen = 0
+    flush_inserts(ungapped_seen)
+
+    for col_idx, t_char in enumerate(template_gapped, start=1):
+        if t_char == "-":
+            template_positions.append("-")
+            query_positions.append("-")
+            template_column_map.append(col_idx)
+            continue
+
+        flush_inserts(ungapped_seen)
+
+        if pair_idx >= len(aligned_pairs):
+            template_positions.append(t_char)
+            query_positions.append("-")
+            template_column_map.append(col_idx)
+        else:
+            aligned_t_char, aligned_q_char = aligned_pairs[pair_idx]
+            if aligned_t_char == "-":
+                template_positions.append(t_char)
+                query_positions.append("-")
+                template_column_map.append(col_idx)
+            else:
+                template_positions.append(t_char)
+                query_positions.append(aligned_q_char)
+                template_column_map.append(col_idx)
+                pair_idx += 1
+        ungapped_seen += 1
+
+    while pair_idx < len(aligned_pairs):
+        aligned_t_char, aligned_q_char = aligned_pairs[pair_idx]
+        if aligned_t_char == "-":
+            template_positions.append("-")
+            query_positions.append(aligned_q_char)
+            template_column_map.append(None)
+        pair_idx += 1
+
+    return "".join(template_positions), "".join(query_positions), template_column_map
+
+
+def run_global_pairwise_alignment(query_seq: str, germline_seq_gapped: str) -> Dict:
+    """Align query to a VJ template and project onto IMGT gapped columns."""
+    aligner = PairwiseAligner(mode="global")
+    aligner.match_score = 2.0
+    aligner.mismatch_score = -1.0
+    aligner.open_gap_score = -8.0
+    aligner.extend_gap_score = -0.5
+
+    germline_seq_ungapped = germline_seq_gapped.replace("-", "")
+    alignment = aligner.align(germline_seq_ungapped, query_seq)[0]
+    aligned_template_ungapped, aligned_query_ungapped = _alignment_to_strings(
+        germline_seq_ungapped,
+        query_seq,
+        alignment,
+    )
+    aligned_germline, aligned_query, template_column_map = _project_alignment_to_gapped_template(
+        germline_seq_gapped,
+        aligned_template_ungapped,
+        aligned_query_ungapped,
+    )
+
+    non_gap_pairs = 0
+    matches = 0
+    for g_res, q_res in zip(aligned_germline, aligned_query):
+        if g_res == "-" or q_res == "-":
+            continue
+        non_gap_pairs += 1
+        if g_res == q_res:
+            matches += 1
+
+    identity = (matches / non_gap_pairs) if non_gap_pairs else 0.0
+    gaps = aligned_germline.count("-") + aligned_query.count("-")
+
+    return {
+        "aligned_germline": aligned_germline,
+        "aligned_query": aligned_query,
+        "template_column_map": template_column_map,
+        "score": float(alignment.score),
+        "identity": identity,
+        "gaps": gaps,
+    }
+
+
+def build_numbering_from_alignment(
+    aligned_query: str,
+    aligned_germline: str,
+    template_column_map: Optional[List[Optional[int]]] = None,
+) -> List[Tuple[int, str]]:
+    """Derive numbering directly from template columns.
+
+    Template columns (including '-' columns in vj_sequence_imgt) keep their own
+    sequential numeric position. Only true extra query insertions (no template
+    column) receive insertion suffixes.
+    """
+    numbering = []
+    current_pos = 0
+    insert_counts: Dict[int, int] = {}
+
+    if template_column_map is None:
+        template_column_map = [i + 1 for i in range(len(aligned_germline))]
+
+    for q_res, col_idx in zip(aligned_query, template_column_map):
+        if col_idx is not None:
+            current_pos = col_idx
+            numbering.append((current_pos, ""))
+            insert_counts[current_pos] = 0
+        else:
+            anchor_pos = current_pos if current_pos > 0 else 1
+            insert_counts[anchor_pos] = insert_counts.get(anchor_pos, 0) + 1
+            suffix_idx = insert_counts[anchor_pos]
+            suffix = chr(ord("A") + suffix_idx - 1) if suffix_idx <= 26 else f"I{suffix_idx}"
+            numbering.append((anchor_pos, suffix))
+
+    return numbering
+
+
+def _select_germline_candidates(chain_filter: Optional[str], selected_gene: Optional[str]) -> List[Dict]:
+    """Select germline candidates based on chain filter and optional explicit gene."""
+    records = get_germline_records()
+    if selected_gene:
+        selected = [r for r in records if r.get("v_gene") == selected_gene]
+        if chain_filter:
+            selected = [r for r in selected if r["chain"] == chain_filter]
+        return selected
+
+    candidates = []
+    for record in records:
+        if chain_filter and record["chain"] != chain_filter:
+            continue
+        if record["segment"] != "V":
+            continue
+        candidates.append(record)
+    return candidates
+
+
+def run_germline_pairwise_alignment(
+    sequence: str,
+    chain_filter: Optional[str] = None,
+    selected_gene: Optional[str] = None,
+) -> Dict:
+    """Align query sequence against best-matching V-gene IMGT template."""
+    try:
         sequence = sequence.replace("\n", "").replace(" ", "").upper()
-        
-        if len(sequence) < 50:
-            return {"status": "error", "message": "Sequence too short (need ~100+ AA)"}
-        
-        # Run alignment using lazy-loaded module
-        results = anarci.anarci(
-            sequences=[(seq_id, sequence)],
-            scheme="imgt",
-            assign_germline=True,
-            allowed_species=['human', 'mouse']
-        )
-        
-        if not results or len(results) < 2:
-            return {"status": "failed", "message": "ANARCI returned unexpected structure"}
-        
-        alignments = results[0]
-        
-        if not alignments or len(alignments) == 0:
-            return {"status": "failed", "message": "No alignments returned"}
-        
-        seq_alignment = alignments[0]
-        alignment_tuple = seq_alignment[0]
-        alignment_data = alignment_tuple[0]
-        
-        if not alignment_data:
-            return {"status": "failed", "message": "No alignment data"}
-        
-        numbering = []
-        query_seq = []
-        
-        for item in alignment_data:
-            position_info, amino_acid = item
-            numbering.append(position_info)
-            query_seq.append(amino_acid)
-        
-        chain = "H"
-        v_gene = None
+        if len(sequence) < MIN_SEQUENCE_LENGTH:
+            return {
+                "status": "error",
+                "message": f"Sequence too short (need at least {MIN_SEQUENCE_LENGTH} AA)",
+            }
+
+        candidates = _select_germline_candidates(chain_filter, selected_gene)
+        if not candidates:
+            return {
+                "status": "error",
+                "message": "No compatible germline candidates found for selected options",
+            }
+
+        best_record = None
+        best_alignment = None
+        best_rank = None
+
+        for record in candidates:
+            alignment = run_global_pairwise_alignment(sequence, record["aligned_seq"])
+            rank = (
+                alignment["score"],
+                alignment["identity"],
+                -alignment["gaps"],
+                record["gene_id"],
+            )
+            if best_rank is None or rank > best_rank:
+                best_rank = rank
+                best_record = record
+                best_alignment = alignment
+
+        if best_record is None or best_alignment is None:
+            return {"status": "failed", "message": "No valid alignment generated"}
+
+        v_gene = best_record.get("v_gene")
         j_gene = None
-        d_gene = None
-        germline_species = None
-        evalue = None
-        bitscore = None
-        query_range = None
-        
-        if len(results) > 1 and results[1]:
-            matches = results[1]
-            if matches and len(matches) > 0:
-                match_info = matches[0]
-                if match_info and len(match_info) > 0:
-                    first_match = match_info[0]
-                    if isinstance(first_match, dict):
-                        chain = first_match.get('chain_type', 'H')
-                        evalue = first_match.get('evalue', None)
-                        bitscore = first_match.get('bitscore', None)
-                        query_start = first_match.get('query_start', 0)
-                        query_end = first_match.get('query_end', len(query_seq))
-                        query_range = (query_start, query_end)
-                        
-                        germlines = first_match.get('germlines', {})
-                        if germlines:
-                            if 'v_gene' in germlines:
-                                v_info = germlines['v_gene']
-                                if v_info and len(v_info) > 0:
-                                    germline_species = v_info[0][0]
-                                    v_gene = v_info[0][1]
-                            if 'd_gene' in germlines:
-                                d_info = germlines['d_gene']
-                                if d_info and len(d_info) > 0 and d_info[0]:
-                                    d_gene = d_info[0][1]
-                            if 'j_gene' in germlines:
-                                j_info = germlines['j_gene']
-                                if j_info and len(j_info) > 0 and j_info[0]:
-                                    j_gene = j_info[0][1]
-        
-        v_sequence = get_germline_sequence(v_gene, germline_db) if v_gene else None
-        j_sequence = get_germline_sequence(j_gene, germline_db) if j_gene else None
-        
-        germline_seq = None
-        if v_sequence and j_sequence:
-            germline_seq = v_sequence + j_sequence
-        elif v_sequence:
-            germline_seq = v_sequence
-        elif j_sequence:
-            germline_seq = j_sequence
-        
+        chain = best_record["chain"] or "?"
+        numbering = build_numbering_from_alignment(
+            best_alignment["aligned_query"],
+            best_alignment["aligned_germline"],
+            best_alignment.get("template_column_map"),
+        )
+
         return {
-            "query_seq": "".join(query_seq),
-            "germline_seq": germline_seq,
+            "query_seq": best_alignment["aligned_query"],
+            "germline_seq": best_alignment["aligned_germline"],
             "numbering": numbering,
             "v_gene": v_gene,
-            "d_gene": d_gene,
             "j_gene": j_gene,
-            "germline_species": germline_species,
-            "evalue": evalue,
-            "bitscore": bitscore,
-            "query_range": query_range,
+            "selected_germline": v_gene,
+            "selected_allele": best_record.get("v_allele"),
+            "matched_j_allele": best_record.get("j_allele"),
             "chain": chain,
-            "status": "success"
+            "alignment_score": best_alignment["score"],
+            "alignment_identity": best_alignment["identity"],
+            "status": "success",
         }
-    
+
     except Exception as e:
-        import traceback
-        traceback.print_exc()
         return {"status": "error", "message": f"{type(e).__name__}: {str(e)}"}
 
 # ============================================================================
@@ -592,18 +805,59 @@ def create_excel_buffer(df: pd.DataFrame, sheet_name: str = "Data") -> BytesIO:
     buffer.seek(0)
     return buffer
 
+
+def format_highlighted_fasta_html(
+    query_seq: str,
+    germline_seq: str,
+    query_header: str,
+    germline_header: str,
+) -> str:
+    """Render FASTA-style alignment where residue substitutions are bold red."""
+    max_len = max(len(query_seq), len(germline_seq))
+    query_seq = query_seq.ljust(max_len, "-")
+    germline_seq = germline_seq.ljust(max_len, "-")
+
+    query_tokens: List[str] = []
+    germline_tokens: List[str] = []
+
+    for q_res, g_res in zip(query_seq, germline_seq):
+        is_change = (q_res != g_res) and (q_res != "-") and (g_res != "-")
+        q_char = html.escape(q_res)
+        g_char = html.escape(g_res)
+        if is_change:
+            query_tokens.append(f"<span style='color:#b00020; font-weight:700;'>{q_char}</span>")
+            germline_tokens.append(f"<span style='color:#b00020; font-weight:700;'>{g_char}</span>")
+        else:
+            query_tokens.append(q_char)
+            germline_tokens.append(g_char)
+
+    query_line = "".join(query_tokens)
+    germline_line = "".join(germline_tokens)
+
+    blocks = [f"&gt;{html.escape(query_header)}"]
+    blocks.append(query_line)
+    blocks.append(f"&gt;{html.escape(germline_header)}")
+    blocks.append(germline_line)
+
+    html_lines = "<br/>".join(blocks)
+    return (
+        "<div style='font-family: monospace; white-space: nowrap; overflow-x: auto; line-height: 1.4;'>"
+        + html_lines
+        + "</div>"
+    )
+
 # ============================================================================
 # APP TITLE
 # ============================================================================
 
 st.title("🧪 Light chain sequence analysis")
-st.markdown("**Analyze protein sequences to IMGT numbering with V/D/J gene assignment**")
+st.markdown("**Analyze protein sequences with pairwise germline alignment and IMGT-like numbering**")
 
 # Info banner on first visit
 if "info_shown" not in st.session_state:
     st.info("""
-    ⏱️ **First Time?** When you submit your first sequence, ANARCI models will download (~1-2 minutes).
-    This is a one-time process. All subsequent submissions will be instant!
+    Use **Choose best** to auto-select the highest-scoring germline,
+    or select **Kappa/Lambda** and optionally lock to a specific germline gene.
     """)
     st.session_state.info_shown = True
 
@@ -613,25 +867,31 @@ if "info_shown" not in st.session_state:
 
 with st.sidebar:
     st.header("⚙️ Settings")
+    template_df = get_imgt_v_template_table()
     
     st.markdown("**Instructions:**")
     st.markdown("""
     1. Paste your query sequence
-    2. Click "Run ANARCI"
-    3. V/D/J genes and germline will be automatically assigned
-    4. Review and edit alignment if needed
-    5. Check residue frequency analysis
-    6. Export when satisfied
+    2. Select chain mode: Choose best, Kappa, or Lambda
+    3. Optionally pre-specify a V gene
+    4. Click "Run Pairwise Alignment"
+    5. Alignment to IMGT-gapped VJ template is generated
+    6. Review and edit alignment if needed
+    7. Check residue frequency analysis
+    8. Export when satisfied
     """)
     
     st.markdown("---")
     st.markdown("**Database Status:**")
     
-    if germline_db and len(germline_db) > 0:
-        st.success(f"✅ {len(germline_db)} germline sequences loaded")
+    if not template_df.empty:
+        n_alleles = template_df["v_allele"].nunique()
+        n_genes = template_df["v_gene"].nunique()
+        n_templates = len(template_df)
+        st.success(f"✅ {n_templates} IMGT-gapped VJ templates loaded ({n_alleles} V alleles / {n_genes} V genes)")
     else:
-        st.warning("⚠️ No germline database found")
-        st.caption("Expected: data/imgt_iglv_iglj.fas")
+        st.warning("⚠️ No IMGT V-template table found")
+        st.caption("Expected: data/imgt.all.lc.alleles.txt")
     
     if not freq_matrix.empty:
         st.success(f"✅ Residue frequency matrix loaded")
@@ -640,11 +900,7 @@ with st.sidebar:
         st.caption("Expected: data/oas_matrices_dash.txt")
     
     st.markdown("---")
-    st.markdown("**⚠️ Note on First Run**")
-    st.markdown("""
-    ANARCI models (~150 MB) download when you submit your first sequence. 
-    This takes 1-2 minutes. Subsequent submissions are instant.
-    """)
+    st.caption("Pairwise alignment runs against IMGT-gapped VJ templates from the bundled TSV table.")
 
     
 # ============================================================================
@@ -693,28 +949,67 @@ with tab1:
             
             query_len = len(input_seq.replace("\n", "").replace(" ", ""))
             st.caption(f"Length: {query_len} AA")
+
+            group_label_to_code = {
+                "Choose best": None,
+                "Kappa (IGK)": "K",
+                "Lambda (IGL)": "L",
+            }
+            selected_group_label = st.selectbox(
+                "Germline group",
+                options=list(group_label_to_code.keys()),
+                index=0,
+                key="germline_group_selector",
+                help="Choose best searches all light-chain germlines. Kappa/Lambda constrains candidates.",
+            )
+            selected_chain_filter = group_label_to_code[selected_group_label]
+
+            available_genes = get_gene_choices(selected_chain_filter)
+            gene_options = [GERMLINE_BEST_OPTION] + available_genes
+            selected_gene_choice = st.selectbox(
+                "Optional V-gene override",
+                options=gene_options,
+                index=0,
+                key="germline_gene_selector",
+                help="Pick a specific variable gene to constrain candidates, or keep choose best.",
+            )
             
-            run_clicked = st.form_submit_button("🔄 Run ANARCI Alignment", width='stretch')
+            run_clicked = st.form_submit_button("🔄 Run Pairwise Alignment", width='stretch')
     
     if run_clicked:
         clean_query = "".join(input_seq.split()).upper()
+        selected_gene = None if selected_gene_choice == GERMLINE_BEST_OPTION else selected_gene_choice
         
-        with st.spinner("Running ANARCI with germline assignment..."):
-            result = run_anarci_alignment(clean_query, seq_id="query")
+        with st.spinner("Running pairwise alignment against germline database..."):
+            result = run_germline_pairwise_alignment(
+                clean_query,
+                chain_filter=selected_chain_filter,
+                selected_gene=selected_gene,
+            )
         
         if result["status"] == "success":
             st.success("✅ Alignment successful!")
-            if result.get("v_gene"):
-                genes = f"V: {result['v_gene']}"
+            if result.get("v_gene") or result.get("j_gene"):
+                genes = []
+                if result.get("v_gene"):
+                    genes.append(f"V: {result['v_gene']}")
                 if result.get("j_gene"):
-                    genes += f", J: {result['j_gene']}"
-                if result.get("d_gene"):
-                    genes += f", D: {result['d_gene']}"
-                st.info(f"✅ {genes}")
+                    genes.append(f"J: {result['j_gene']}")
+                st.info(f"✅ {', '.join(genes)}")
+            if result.get("selected_germline"):
+                selected_v_gene = str(result["selected_germline"]).replace("*", "\\*")
+                selected_text = f"Selected V gene: {selected_v_gene}"
+                if result.get("selected_allele"):
+                    selected_allele = str(result["selected_allele"]).replace("*", "\\*")
+                    selected_text += f" (best allele: {selected_allele})"
+                if result.get("matched_j_allele"):
+                    matched_j_allele = str(result["matched_j_allele"]).replace("*", "\\*")
+                    selected_text += f", matched J: {matched_j_allele}"
+                st.info(selected_text)
             if result.get("germline_seq"):
-                st.success("✅ Germline sequence found (V+J concatenated)")
+                st.success("✅ Germline alignment generated")
             else:
-                st.warning(f"⚠️ Germline sequence not found in database")
+                st.warning("⚠️ Germline sequence not found in database")
             
             st.session_state.alignment_result = result
             st.session_state.show_alignment = True
@@ -735,18 +1030,22 @@ with tab1:
         with col3:
             st.metric("V Gene", result.get("v_gene", "N/A"))
         with col4:
-            st.metric("J Gene", result.get("j_gene", "N/A"))
+            st.metric("Best Allele", result.get("selected_allele", "N/A"))
         
         col1, col2, col3 = st.columns(3)
         with col1:
-            if result.get("d_gene"):
-                st.metric("D Gene", result.get("d_gene"))
+            st.metric("Selected Germline", result.get("selected_germline", "N/A"))
         with col2:
-            if result.get("bitscore"):
-                st.metric("Bit Score", f"{result['bitscore']:.1f}")
+            if result.get("alignment_score") is not None:
+                st.metric("Alignment Score", f"{result['alignment_score']:.1f}")
         with col3:
-            if result.get("evalue"):
-                st.metric("E-value", f"{result['evalue']:.2e}")
+            if result.get("alignment_identity") is not None:
+                st.metric("Pairwise Identity", f"{result['alignment_identity'] * 100:.1f}%")
+
+        st.info(
+            "If the alignment is not giving the expected V gene, try identifying the V gene with "
+            "IMGT's DomainGapAlign tool: https://www.imgt.org/3Dstructure-DB/cgi/DomainGapAlign.cgi"
+        )
         
         st.markdown("---")
         
@@ -809,22 +1108,24 @@ with tab1:
         
         st.markdown("---")
         
-        st.write("**Full Aligned Sequence:**")
-        
-        st.dataframe(
-            alignment_df,
-            width='stretch',
-            height=500
+        st.write("**FASTA Alignment (Residue Changes in Bold):**")
+        query_text = "".join(alignment_df["Query"].astype(str))
+        germline_text = "".join(alignment_df["Germline"].astype(str))
+        fasta_html = format_highlighted_fasta_html(
+            query_text,
+            germline_text,
+            seq_name_display,
+            "germline_VJ_template",
         )
-        
+        st.markdown(fasta_html, unsafe_allow_html=True)
+
         st.markdown("---")
-        with st.expander("📋 View as Text (FASTA)"):
-            query_text = "".join(alignment_df["Query"].astype(str))
-            germline_text = "".join(alignment_df["Germline"].astype(str))
-            
-            fasta_text = f">{seq_name_display}\n{query_text}\n>germline_V+J\n{germline_text}"
-            
-            st.code(fasta_text, language="fasta")
+        with st.expander("📋 View Full Aligned Table"):
+            st.dataframe(
+                alignment_df,
+                width='stretch',
+                height=500
+            )
 
 # ============================================================================
 # TAB 2: MANUAL EDITING & EXPORT
@@ -951,7 +1252,7 @@ with tab2:
             )
     
     else:
-        st.info("⏳ Run ANARCI alignment first (Tab 1)")
+        st.info("⏳ Run pairwise alignment first (Tab 1)")
 
 # ============================================================================
 # TAB 3: RESIDUE FREQUENCY ANALYSIS
@@ -969,212 +1270,221 @@ with tab3:
         v_gene_normalized = normalize_v_gene(v_gene) if v_gene else None
         
         if not freq_matrix.empty:
-            # Find first and last non-gap positions in query
-            query_seq = df["Query"].astype(str)
-            first_non_gap = None
-            last_non_gap = None
-            
-            for i, res in enumerate(query_seq):
-                if res != "-":
-                    if first_non_gap is None:
-                        first_non_gap = i
-                    last_non_gap = i
-            
-            # Build frequency analysis (freq_matrix is global)
-            freq_analysis_full = build_frequency_analysis(df, v_gene)
-            
-            # Filter to include only positions within the non-gap range
-            if first_non_gap is not None and last_non_gap is not None:
-                freq_analysis = freq_analysis_full.iloc[first_non_gap:last_non_gap+1].reset_index(drop=True)
+            if not v_gene:
+                st.warning("Residue frequency analysis needs a V-gene alignment. Choose best or select a V germline in Tab 1.")
             else:
-                freq_analysis = freq_analysis_full
-            
-            st.markdown(f"**Sequence:** {seq_name}")
-            st.markdown(f"**V Gene:** {v_gene} → {v_gene_normalized}")
-            st.markdown("Showing **frequency** of residue at each IMGT position from healthy repertoire (excluding terminal gaps)")
-            
-            st.markdown("---")
-            st.subheader("📈 Residue Frequency Distribution")
-            
-            # Get numeric frequencies for plotting
-            freqs = freq_analysis["Frequency_num"].dropna()
-            positions = freq_analysis.loc[freqs.index, "Position"]
-            residues = freq_analysis.loc[freqs.index, "Residue"]
-            
-            if len(freqs) > 0:
-                # Create bar chart
-                fig, ax = plt.subplots(figsize=(16, 6))
-                
-                # Determine colors based on thresholds
-                colors = []
-                for freq in freqs:
-                    if freq < RARE_RESIDUE_THRESHOLD_1:
-                        colors.append('navy')
-                    elif freq < RARE_RESIDUE_THRESHOLD_2:
-                        colors.append('cornflowerblue')
-                    else:
-                        colors.append('grey')
-                
-                x_pos = np.arange(len(freqs))
-                
-                # Create bars that drop from top
-                bars = ax.bar(x_pos, 1.0 - freqs, bottom=freqs, 
-                             color=colors, edgecolor='black', linewidth=0.5, width=0.8)
-                
-                # Add query residue labels above bars
-                for i, (x, residue, freq) in enumerate(zip(x_pos, residues, freqs)):
-                    if freq < RARE_RESIDUE_THRESHOLD_1:
-                        color = 'navy'
-                    elif freq < RARE_RESIDUE_THRESHOLD_2:
-                        color = 'cornflowerblue'
-                    else:
-                        color = 'black'
-                    ax.text(x, 1.05, residue, ha='center', va='bottom', 
-                           fontsize=9, fontweight='bold', color=color)
-                
-                # Set y-axis to log scale
-                ax.set_yscale('log')
-                ax.set_ylim([0.001, 1.5])
-                
-                ax.set_yticks([1.0, 0.1, 0.01, 0.001])
-                ax.set_yticklabels(['100%', '10%', '1%', '0.1%'])
-                ax.set_ylabel("Residue frequency", fontsize=12, fontweight='bold')
-                
-                # Add horizontal dashed lines at thresholds
-                ax.axhline(y=0.1, linestyle='--', color='black', linewidth=0.8, alpha=0.5)
-                ax.axhline(y=0.01, linestyle='--', color='black', linewidth=0.8, alpha=0.5)
-                ax.axhline(y=0.001, linestyle='--', color='black', linewidth=0.8, alpha=0.5)
-                
-                # Configure x-axis - only label every 10th
-                ax.set_xticks(x_pos)
-                tick_labels = [positions.iloc[i] if i % 10 == 0 else '' for i in range(len(positions))]
-                ax.set_xticklabels(tick_labels, fontsize=10)
-                ax.set_xlabel("IMGT position", fontsize=12, fontweight='bold')
-                
-                ax.set_xlim([-0.5, len(freqs) - 0.5])
-                
-                # Title
-                ax.set_title(f"Residue Frequency Profile - {seq_name} ({v_gene_normalized})", fontsize=14, fontweight='bold')
-                
-                # Grid
-                ax.grid(axis='y', alpha=0.3)
-                
-                plt.tight_layout()
-                st.pyplot(fig)
-                
-                # Export buttons for frequency profile
+                # Find first and last non-gap positions in query
+                query_seq = df["Query"].astype(str)
+                first_non_gap = None
+                last_non_gap = None
+
+                for i, res in enumerate(query_seq):
+                    if res != "-":
+                        if first_non_gap is None:
+                            first_non_gap = i
+                        last_non_gap = i
+
+                # Build frequency analysis (freq_matrix is global)
+                freq_analysis_full = build_frequency_analysis(df, v_gene)
+
+                # Filter to include only positions within the non-gap range
+                if first_non_gap is not None and last_non_gap is not None:
+                    freq_analysis = freq_analysis_full.iloc[first_non_gap:last_non_gap+1].reset_index(drop=True)
+                else:
+                    freq_analysis = freq_analysis_full
+
+                st.markdown(f"**Sequence:** {seq_name}")
+                st.markdown(f"**V Gene:** {v_gene} → {v_gene_normalized}")
+                st.markdown("Showing **frequency** of residue at each IMGT position from healthy repertoire (excluding terminal gaps)")
+
                 st.markdown("---")
-                st.subheader("📤 Export Frequency Profile")
-                
-                col1, col2, col3 = st.columns(3)
-                
-                with col1:
-                    # Export as PNG
-                    png_buffer = BytesIO()
-                    fig.savefig(png_buffer, format='png', dpi=300, bbox_inches='tight')
-                    png_buffer.seek(0)
-                    st.download_button(
-                        "🖼️ PNG (High-res)",
-                        data=png_buffer.getvalue(),
-                        file_name=f"{seq_name}_frequency_profile.png",
-                        mime="image/png",
-                        width='stretch'
+                st.subheader("📈 Residue Frequency Distribution")
+
+                # Get numeric frequencies for plotting
+                freqs = freq_analysis["Frequency_num"].dropna()
+                positions = freq_analysis.loc[freqs.index, "Position"]
+                residues = freq_analysis.loc[freqs.index, "Residue"]
+
+                if len(freqs) > 0:
+                    # Create bar chart
+                    fig, ax = plt.subplots(figsize=(16, 6))
+
+                    # Determine colors based on thresholds
+                    colors = []
+                    for freq in freqs:
+                        if freq < RARE_RESIDUE_THRESHOLD_1:
+                            colors.append('navy')
+                        elif freq < RARE_RESIDUE_THRESHOLD_2:
+                            colors.append('cornflowerblue')
+                        else:
+                            colors.append('grey')
+
+                    x_pos = np.arange(len(freqs))
+
+                    # Create bars that drop from top
+                    ax.bar(
+                        x_pos,
+                        1.0 - freqs,
+                        bottom=freqs,
+                        color=colors,
+                        edgecolor='black',
+                        linewidth=0.5,
+                        width=0.8,
                     )
-                
-                with col2:
-                    # Export as PDF
-                    pdf_buffer = BytesIO()
-                    fig.savefig(pdf_buffer, format='pdf', bbox_inches='tight')
-                    pdf_buffer.seek(0)
-                    st.download_button(
-                        "📄 PDF",
-                        data=pdf_buffer.getvalue(),
-                        file_name=f"{seq_name}_frequency_profile.pdf",
-                        mime="application/pdf",
-                        width='stretch'
-                    )
-                
-                with col3:
-                    # Export frequency data as CSV
-                    csv_data = freq_analysis.copy()
-                    csv_data["Frequency"] = csv_data["Frequency_num"].apply(lambda x: f"{x:.4f}" if isinstance(x, float) else x)
-                    csv_data = csv_data[["Position", "Residue", "Frequency"]]
-                    
-                    st.download_button(
-                        "📋 CSV Data",
-                        data=csv_data.to_csv(index=False),
-                        file_name=f"{seq_name}_frequency_profile.csv",
-                        mime="text/csv",
-                        width='stretch'
-                    )
-                
-                st.markdown("---")
-                st.subheader("📊 Summary Statistics")
-                
-                col1, col2, col3, col4 = st.columns(4)
-                with col1:
-                    st.metric("Mean Frequency", f"{freqs.mean():.2%}")
-                with col2:
-                    st.metric("Median Frequency", f"{freqs.median():.2%}")
-                with col3:
-                    st.metric("Min Frequency", f"{freqs.min():.2%}")
-                with col4:
-                    st.metric("Max Frequency", f"{freqs.max():.2%}")
-                
-                # Show positions with very rare residues
-                very_rare = freq_analysis[freq_analysis["Frequency_num"] < RARE_RESIDUE_THRESHOLD_1]
-                if len(very_rare) > 0:
+
+                    # Add query residue labels above bars
+                    for x, residue, freq in zip(x_pos, residues, freqs):
+                        if freq < RARE_RESIDUE_THRESHOLD_1:
+                            color = 'navy'
+                        elif freq < RARE_RESIDUE_THRESHOLD_2:
+                            color = 'cornflowerblue'
+                        else:
+                            color = 'black'
+                        ax.text(x, 1.05, residue, ha='center', va='bottom', fontsize=9, fontweight='bold', color=color)
+
+                    # Set y-axis to log scale
+                    ax.set_yscale('log')
+                    ax.set_ylim([0.001, 1.5])
+
+                    ax.set_yticks([1.0, 0.1, 0.01, 0.001])
+                    ax.set_yticklabels(['100%', '10%', '1%', '0.1%'])
+                    ax.set_ylabel("Residue frequency", fontsize=12, fontweight='bold')
+
+                    # Add horizontal dashed lines at thresholds
+                    ax.axhline(y=0.1, linestyle='--', color='black', linewidth=0.8, alpha=0.5)
+                    ax.axhline(y=0.01, linestyle='--', color='black', linewidth=0.8, alpha=0.5)
+                    ax.axhline(y=0.001, linestyle='--', color='black', linewidth=0.8, alpha=0.5)
+
+                    # Configure x-axis - only label every 10th
+                    ax.set_xticks(x_pos)
+                    tick_labels = [positions.iloc[i] if i % 10 == 0 else '' for i in range(len(positions))]
+                    ax.set_xticklabels(tick_labels, fontsize=10)
+                    ax.set_xlabel("IMGT position", fontsize=12, fontweight='bold')
+
+                    ax.set_xlim([-0.5, len(freqs) - 0.5])
+
+                    # Title
+                    ax.set_title(f"Residue Frequency Profile - {seq_name} ({v_gene_normalized})", fontsize=14, fontweight='bold')
+
+                    # Grid
+                    ax.grid(axis='y', alpha=0.3)
+
+                    plt.tight_layout()
+                    st.pyplot(fig)
+
+                    # Export buttons for frequency profile
                     st.markdown("---")
-                    
-                    # Proper grammar for singular/plural
-                    count_text = f"{len(very_rare)} position" if len(very_rare) == 1 else f"{len(very_rare)} positions"
-                    has_text = "has" if len(very_rare) == 1 else "have"
-                    residue_text = "residue" if len(very_rare) == 1 else "residues"
-                    
-                    st.warning(f"🔴 {count_text} {has_text} very rare {residue_text} (frequency < 0.1%)")
-                    st.dataframe(
-                        very_rare[["Position", "Residue", "Frequency"]].assign(
-                            Frequency=very_rare["Frequency_num"].apply(lambda x: f"{x:.2%}")
-                        )[["Position", "Residue", "Frequency"]],
-                        width='stretch'
-                    )
-                
-                # Show positions with rare residues
-                rare_positions = freq_analysis[freq_analysis["Frequency_num"] < RARE_RESIDUE_THRESHOLD_2]
-                if len(rare_positions) > 0:
+                    st.subheader("📤 Export Frequency Profile")
+
+                    col1, col2, col3 = st.columns(3)
+
+                    with col1:
+                        # Export as PNG
+                        png_buffer = BytesIO()
+                        fig.savefig(png_buffer, format='png', dpi=300, bbox_inches='tight')
+                        png_buffer.seek(0)
+                        st.download_button(
+                            "🖼️ PNG (High-res)",
+                            data=png_buffer.getvalue(),
+                            file_name=f"{seq_name}_frequency_profile.png",
+                            mime="image/png",
+                            width='stretch'
+                        )
+
+                    with col2:
+                        # Export as PDF
+                        pdf_buffer = BytesIO()
+                        fig.savefig(pdf_buffer, format='pdf', bbox_inches='tight')
+                        pdf_buffer.seek(0)
+                        st.download_button(
+                            "📄 PDF",
+                            data=pdf_buffer.getvalue(),
+                            file_name=f"{seq_name}_frequency_profile.pdf",
+                            mime="application/pdf",
+                            width='stretch'
+                        )
+
+                    with col3:
+                        # Export frequency data as CSV
+                        csv_data = freq_analysis.copy()
+                        csv_data["Frequency"] = csv_data["Frequency_num"].apply(lambda x: f"{x:.4f}" if isinstance(x, float) else x)
+                        csv_data = csv_data[["Position", "Residue", "Frequency"]]
+
+                        st.download_button(
+                            "📋 CSV Data",
+                            data=csv_data.to_csv(index=False),
+                            file_name=f"{seq_name}_frequency_profile.csv",
+                            mime="text/csv",
+                            width='stretch'
+                        )
+
                     st.markdown("---")
-                    
-                    # Proper grammar for singular/plural
-                    count_text = f"{len(rare_positions)} position" if len(rare_positions) == 1 else f"{len(rare_positions)} positions"
-                    has_text = "has" if len(rare_positions) == 1 else "have"
-                    residue_text = "residue" if len(rare_positions) == 1 else "residues"
-                    
-                    st.info(f"ℹ️ {count_text} {has_text} rare {residue_text} (frequency < 10%)")
-                    st.dataframe(
-                        rare_positions[["Position", "Residue", "Frequency"]].assign(
-                            Frequency=rare_positions["Frequency_num"].apply(lambda x: f"{x:.2%}")
-                        )[["Position", "Residue", "Frequency"]],
-                        width='stretch'
-                    )
-                
-                # Hidden frequency table
-                st.markdown("---")
-                with st.expander("📋 View Frequency Table"):
-                    display_df = freq_analysis.copy()
-                    display_df["Frequency"] = display_df["Frequency"].apply(
-                        lambda x: f"{x:.2%}" if isinstance(x, float) else x
-                    )
-                    
-                    st.dataframe(
-                        display_df[["Position", "Residue", "Frequency"]],
-                        width='stretch',
-                        height=400
-                    )
-            else:
-                st.warning("No frequency data available for this sequence")
+                    st.subheader("📊 Summary Statistics")
+
+                    col1, col2, col3, col4 = st.columns(4)
+                    with col1:
+                        st.metric("Mean Frequency", f"{freqs.mean():.2%}")
+                    with col2:
+                        st.metric("Median Frequency", f"{freqs.median():.2%}")
+                    with col3:
+                        st.metric("Min Frequency", f"{freqs.min():.2%}")
+                    with col4:
+                        st.metric("Max Frequency", f"{freqs.max():.2%}")
+
+                    # Show positions with very rare residues
+                    very_rare = freq_analysis[freq_analysis["Frequency_num"] < RARE_RESIDUE_THRESHOLD_1]
+                    if len(very_rare) > 0:
+                        st.markdown("---")
+
+                        # Proper grammar for singular/plural
+                        count_text = f"{len(very_rare)} position" if len(very_rare) == 1 else f"{len(very_rare)} positions"
+                        has_text = "has" if len(very_rare) == 1 else "have"
+                        residue_text = "residue" if len(very_rare) == 1 else "residues"
+
+                        st.warning(f"🔴 {count_text} {has_text} very rare {residue_text} (frequency < 0.1%)")
+                        st.dataframe(
+                            very_rare[["Position", "Residue", "Frequency"]].assign(
+                                Frequency=very_rare["Frequency_num"].apply(lambda x: f"{x:.2%}")
+                            )[["Position", "Residue", "Frequency"]],
+                            width='stretch'
+                        )
+
+                    # Show positions with rare residues
+                    rare_positions = freq_analysis[freq_analysis["Frequency_num"] < RARE_RESIDUE_THRESHOLD_2]
+                    if len(rare_positions) > 0:
+                        st.markdown("---")
+
+                        # Proper grammar for singular/plural
+                        count_text = f"{len(rare_positions)} position" if len(rare_positions) == 1 else f"{len(rare_positions)} positions"
+                        has_text = "has" if len(rare_positions) == 1 else "have"
+                        residue_text = "residue" if len(rare_positions) == 1 else "residues"
+
+                        st.info(f"ℹ️ {count_text} {has_text} rare {residue_text} (frequency < 10%)")
+                        st.dataframe(
+                            rare_positions[["Position", "Residue", "Frequency"]].assign(
+                                Frequency=rare_positions["Frequency_num"].apply(lambda x: f"{x:.2%}")
+                            )[["Position", "Residue", "Frequency"]],
+                            width='stretch'
+                        )
+
+                    # Hidden frequency table
+                    st.markdown("---")
+                    with st.expander("📋 View Frequency Table"):
+                        display_df = freq_analysis.copy()
+                        display_df["Frequency"] = display_df["Frequency"].apply(
+                            lambda x: f"{x:.2%}" if isinstance(x, float) else x
+                        )
+
+                        st.dataframe(
+                            display_df[["Position", "Residue", "Frequency"]],
+                            width='stretch',
+                            height=400
+                        )
+                else:
+                    st.warning("No frequency data available for this sequence")
         else:
             st.error("❌ Residue frequency matrix not loaded")
             st.caption("Expected: data/oas_matrices_dash.txt")
     
     else:
-        st.info("⏳ Run ANARCI alignment first (Tab 1)")
+        st.info("⏳ Run pairwise alignment first (Tab 1)")

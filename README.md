@@ -1,6 +1,6 @@
 # Light Chain Sequence Analysis
 
-A Streamlit web application for analyzing antibody light chain variable domain protein sequences with IMGT numbering and V(D)J gene assignment. 
+A Streamlit web application for analyzing antibody light chain variable domain protein sequences using pairwise alignment against IMGT light chain germlines.
 
 Implements the residue frequency analysis described in Morgan and Prokaeva (2025) Frontiers in Immunology https://www.frontiersin.org/journals/immunology/articles/10.3389/fimmu.2025.1622207/full
 
@@ -8,8 +8,10 @@ Please cite that paper if you use the app.
 
 ## Features
 
-- **IMGT Alignment**: Automatic sequence alignment to standardized IMGT numbering
-- **V/D/J Assignment**: Identification of variable, diversity, and joining genes
+- **Pairwise Germline Alignment**: Fast global alignment against bundled IMGT light-chain germline sequences
+- **Two-Step Germline Selection**: Choose best / Kappa / Lambda, with optional explicit germline override
+- **IMGT-like Positioning**: Position labels derived from germline alignment columns
+- **V/J Assignment**: Best-hit gene annotation based on selected germline
 - **N-Glycosylation Detection**: Identifies potential glycosylation sites (N[^P][ST])
 - **Residue Frequency Analysis**: Compare against healthy antibody repertoires
 - **Multiple Exports**: CSV, FASTA, JSON, Excel formats
@@ -21,15 +23,11 @@ Please cite that paper if you use the app.
 
 Visit the live app: [pending]
 
-No installation required - just paste your sequence and click "Run ANARCI"!
-
-**Note:** First alignment may take 1-2 minutes (one-time only). Subsequent submissions are fast.
+No installation required - paste your sequence, choose your germline mode, and click "Run Pairwise Alignment".
 
 ### Local Installation
 
 This allows you to use custom germline sequences and frequency tables, e.g. for heavy chains.
-
-ANARCI requires HMMER. The easiest way to install this is into a dedicated Conda environment.
 
 1. **Clone the repository:**
    ```bash
@@ -44,9 +42,8 @@ ANARCI requires HMMER. The easiest way to install this is into a dedicated Conda
     ```bash
     conda activate light-chain
 
-4. **Install dependencies (including HMMER)**
+4. **Install dependencies**
     ```bash
-    conda install -c bioconda anarci
     conda install -c conda-forge streamlit pandas numpy matplotlib biopython openpyxl requests
     
 5. **Run the app**
