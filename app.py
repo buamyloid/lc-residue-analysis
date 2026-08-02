@@ -806,6 +806,20 @@ def create_excel_buffer(df: pd.DataFrame, sheet_name: str = "Data") -> BytesIO:
     return buffer
 
 
+def load_help_markdown() -> str:
+    """Load the help content from the docs markdown file."""
+    candidates = [
+        Path(__file__).resolve().parent / "docs" / "help.md",
+        Path("docs/help.md"),
+    ]
+
+    for path in candidates:
+        if path.exists():
+            return path.read_text(encoding="utf-8")
+
+    return "Help content not found."
+
+
 def format_highlighted_fasta_html(
     query_seq: str,
     germline_seq: str,
@@ -897,6 +911,10 @@ with st.sidebar:
     else:
         st.warning("⚠️ Frequency matrix not loaded")
         st.caption("Expected: data/oas_matrices_dash.txt")
+
+    st.markdown("---")
+    with st.expander("📘 Help & Citation", expanded=False):
+        st.markdown(load_help_markdown())
     
     st.markdown("---")
     st.caption("Pairwise alignment runs against IMGT-gapped VJ templates from the bundled TSV table.")
