@@ -913,10 +913,6 @@ with st.sidebar:
         st.caption("Expected: data/oas_matrices_dash.txt")
 
     st.markdown("---")
-    with st.expander("📘 Help & Citation", expanded=False):
-        st.markdown(load_help_markdown())
-    
-    st.markdown("---")
     st.caption("Pairwise alignment runs against IMGT-gapped VJ templates from the bundled TSV table.")
 
     
