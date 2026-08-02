@@ -866,10 +866,9 @@ if "info_shown" not in st.session_state:
 # ============================================================================
 
 with st.sidebar:
-    st.header("⚙️ Settings")
+    st.header("Instructions")
     template_df = get_imgt_v_template_table()
     
-    st.markdown("**Instructions:**")
     st.markdown("""
     1. Paste your query sequence
     2. Select chain mode: Choose best, Kappa, or Lambda

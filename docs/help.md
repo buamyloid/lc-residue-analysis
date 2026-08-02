@@ -103,10 +103,6 @@ The goal is to identify residues that are infrequently observed among healthy li
 
 ## Frequently Asked Questions
 
-### Q: Why is no first-run download needed now?
-
-**A:** Alignment is performed with a built-in pairwise method against the bundled IMGT FASTA database. No model download step is required.
-
 ### Q: What sequence format should I use?
 
 **A:** 
@@ -124,11 +120,11 @@ The goal is to identify residues that are infrequently observed among healthy li
 
 ### Q: Can I use this for heavy chains?
 
-**A:** This app is tuned for light chains. Residue frequency data is currently only available for light-chain V genes.
+**A:** Residue frequency data is currently only available for light-chain V genes. You can build a local version if you want to look at heavy chains or other species.
 
 ### Q: What if my gene isn't recognized?
 
-**A:** The app searches the bundled IMGT light-chain germline FASTA and selects the best global pairwise score within your selected mode.
+**A:** The app searches the bundled IMGT light-chain germline FASTA and selects the best global pairwise score within your selected mode. If that doesn't work, try using IMGT's DomainGapAlign to identify the correct V gene, then select that gene at the input stage to override the alignment. 
 
 ---
 
