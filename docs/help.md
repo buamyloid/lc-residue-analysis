@@ -1,5 +1,3 @@
-# Help & Citation
-
 ## Welcome to Light Chain Sequence Analysis
 
 This web application analyzes antibody light chain sequences with pairwise germline alignment and IMGT-like numbering.
